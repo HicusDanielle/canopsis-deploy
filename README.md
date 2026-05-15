@@ -549,7 +549,7 @@ curl -k -H "x-canopsis-authkey: KEY" https://localhost:8443/api/v4/users
 curl -k -X POST -H "x-canopsis-authkey: KEY" \
   -H "Content-Type: application/json" \
   https://localhost:8443/api/v4/users \
-  -d '{"_id": "operator1", "name": "Operator One", "role": "operator", "password": "secure-pass"}'
+  -d '{"_id": "operator1", "name": "Operator One", "role": "operator", "password": "<CHANGE_ME_STRONG_PASSWORD>"}'
 ```
 
 ---

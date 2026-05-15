@@ -20,6 +20,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# --- Input validation ---
+[[ "$DOMAIN" =~ ^[a-zA-Z0-9._-]+$ ]] || { echo "[ERROR] Nom de domaine invalide: $DOMAIN (seuls a-z, 0-9, '.', '-', '_' sont autorisés)"; exit 1; }
+[[ "$EXPOSE_PORT" =~ ^[0-9]+$ ]] || { echo "[ERROR] Port invalide: $EXPOSE_PORT (doit être un nombre)"; exit 1; }
+[[ "$EXPOSE_PORT" -ge 1 && "$EXPOSE_PORT" -le 65535 ]] || { echo "[ERROR] Port hors plage: $EXPOSE_PORT (1-65535)"; exit 1; }
+[[ "$INSTALL_DIR" =~ ^[a-zA-Z0-9/_-]+$ ]] || { echo "[ERROR] Chemin d'installation invalide: $INSTALL_DIR"; exit 1; }
+
 # --- Couleurs ---
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
@@ -120,6 +126,7 @@ CPS_REDIS_PASSWORD=${CPS_REDIS_PASSWORD}
 CANOPSIS_VERSION=${CANOPSIS_VERSION}
 DOMAIN=${DOMAIN}
 EXPOSE_PORT=${EXPOSE_PORT}
+INSTALL_DIR=${INSTALL_DIR}
 ENV
 chmod 600 "$INSTALL_DIR/.env"
 
@@ -135,7 +142,7 @@ info "Phase 3 — Génération du certificat TLS auto-signé"
 
 mkdir -p "$INSTALL_DIR/certs"
 if [[ ! -f "$INSTALL_DIR/certs/server.crt" ]]; then
-  openssl req -x509 -nodes -days 3650 -newkey rsa:4096 \
+  openssl req -x509 -nodes -days 365 -newkey rsa:4096 \
     -keyout "$INSTALL_DIR/certs/server.key" \
     -out "$INSTALL_DIR/certs/server.crt" \
     -subj "/CN=${DOMAIN}" \
@@ -173,6 +180,8 @@ http {
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-XSS-Protection "1; mode=block" always;
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:;" always;
 
     upstream canopsis_api {
         server api:8082;
@@ -185,8 +194,11 @@ http {
         ssl_certificate     /etc/nginx/certs/server.crt;
         ssl_certificate_key /etc/nginx/certs/server.key;
         ssl_protocols       TLSv1.2 TLSv1.3;
-        ssl_ciphers         HIGH:!aNULL:!MD5;
+        ssl_ciphers         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
         ssl_prefer_server_ciphers on;
+        ssl_session_cache shared:SSL:10m;
+        ssl_session_timeout 1d;
+        ssl_session_tickets off;
 
         location / {
             proxy_pass http://canopsis_api;
@@ -203,36 +215,7 @@ http {
 NGINX
 
 ###############################################################################
-# Phase 5 : MongoDB init script
-###############################################################################
-cat > "$INSTALL_DIR/mongo-init.js" <<MONGOINIT
-rs.initiate({
-  _id: "rs0",
-  members: [{ _id: 0, host: "mongodb:27017" }]
-});
-
-var attempts = 0;
-while (!rs.isMaster().ismaster && attempts < 30) {
-  sleep(1000);
-  attempts++;
-}
-
-db.getSiblingDB("admin").createUser({
-  user: "cpsmongo",
-  pwd: "${CPS_MONGO_PASSWORD}",
-  roles: [{ role: "root", db: "admin" }]
-});
-
-db.getSiblingDB("canopsis").createUser({
-  user: "cpsmongo",
-  pwd: "${CPS_MONGO_PASSWORD}",
-  roles: [{ role: "dbOwner", db: "canopsis" }]
-});
-MONGOINIT
-chmod 600 "$INSTALL_DIR/mongo-init.js"
-
-###############################################################################
-# Phase 6 : PostgreSQL init script
+# Phase 5 : PostgreSQL init script
 ###############################################################################
 cat > "$INSTALL_DIR/pg-init.sh" <<PGINIT
 #!/bin/bash
@@ -248,7 +231,7 @@ chmod 755 "$INSTALL_DIR/pg-init.sh"
 ###############################################################################
 info "Phase 5 — Génération du docker-compose.yml"
 
-cat > "$INSTALL_DIR/docker-compose.yml" <<COMPOSE
+cat > "$INSTALL_DIR/docker-compose.yml" <<'COMPOSE'
 version: "3.8"
 
 x-canopsis-env: &canopsis-env
@@ -303,7 +286,7 @@ services:
       - canopsis-net
     mem_limit: 2g
     healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')", "-u", "cpsmongo", "-p", "${CPS_MONGO_PASSWORD}", "--authenticationDatabase", "admin", "--quiet"]
+      test: ["CMD-SHELL", "mongosh --eval \"db.adminCommand('ping')\" -u cpsmongo -p $$MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin --quiet"]
       interval: 15s
       timeout: 10s
       retries: 10
@@ -321,8 +304,9 @@ services:
     depends_on:
       mongodb:
         condition: service_started
+    environment:
+      MONGO_PASSWORD: "${CPS_MONGO_PASSWORD}"
     volumes:
-      - ${INSTALL_DIR}/mongo-init.js:/docker-entrypoint-initdb.d/init.js:ro
       - ${INSTALL_DIR}/mongo-keyfile:/data/keyfile:ro
     entrypoint: >
       bash -c '
@@ -334,12 +318,12 @@ services:
         mongosh --host mongodb:27017/admin --eval "
           var attempts = 0;
           while (!rs.isMaster().ismaster && attempts < 30) { sleep(1000); attempts++; }
+          var pwd = process.env.MONGO_PASSWORD;
           try {
-            db.createUser({user: \"cpsmongo\", pwd: \"${CPS_MONGO_PASSWORD}\", roles: [{role: \"root\", db: \"admin\"}]});
+            db.createUser({user: \"cpsmongo\", pwd: pwd, roles: [{role: \"dbOwner\", db: \"canopsis\"}, {role: \"clusterMonitor\", db: \"admin\"}, {role: \"readWriteAnyDatabase\", db: \"admin\"}]});
           } catch(e) {
             if (e.codeName !== \"DuplicateKey\") throw e;
           }
-          db.getSiblingDB(\"canopsis\");
         "
       '
     networks:
@@ -375,13 +359,15 @@ services:
     container_name: canopsis-redis
     restart: unless-stopped
     command: ["redis-server", "--requirepass", "${CPS_REDIS_PASSWORD}", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru"]
+    environment:
+      REDISCLI_AUTH: "${CPS_REDIS_PASSWORD}"
     volumes:
       - redisdata:/data
     networks:
       - canopsis-net
     mem_limit: 768m
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${CPS_REDIS_PASSWORD}", "ping"]
+      test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -542,6 +528,7 @@ services:
         max-size: "20m"
         max-file: "5"
 COMPOSE
+chmod 600 "$INSTALL_DIR/docker-compose.yml"
 
 ###############################################################################
 # Phase 8 : Script de backup
@@ -556,9 +543,17 @@ INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
 BACKUP_DIR="${INSTALL_DIR}/backups/$(date +%Y%m%d-%H%M%S)"
 RETENTION_DAYS="${1:-7}"
 
-source "$INSTALL_DIR/.env"
+# Validate retention days (prevent injection)
+if ! [[ "$RETENTION_DAYS" =~ ^[0-9]+$ ]]; then
+  echo "[ERROR] Rétention invalide: $RETENTION_DAYS (doit être un nombre)" >&2
+  exit 1
+fi
+
+# Parse .env safely (no source/eval)
+CPS_MONGO_PASSWORD=$(grep -E '^CPS_MONGO_PASSWORD=' "$INSTALL_DIR/.env" | cut -d= -f2-)
 
 mkdir -p "$BACKUP_DIR"
+chmod 700 "$BACKUP_DIR"
 
 echo "[$(date -Iseconds)] Backup MongoDB..."
 docker exec canopsis-mongodb mongodump \
@@ -574,9 +569,10 @@ echo "[$(date -Iseconds)] Sauvegarde .env et configs..."
 cp "$INSTALL_DIR/.env" "$BACKUP_DIR/env.bak"
 cp "$INSTALL_DIR/docker-compose.yml" "$BACKUP_DIR/docker-compose.yml.bak"
 cp "$INSTALL_DIR/nginx.conf" "$BACKUP_DIR/nginx.conf.bak"
+chmod 600 "$BACKUP_DIR/env.bak"
 
 echo "[$(date -Iseconds)] Nettoyage des backups > ${RETENTION_DAYS} jours..."
-find "${INSTALL_DIR}/backups" -maxdepth 1 -type d -mtime +${RETENTION_DAYS} -exec rm -rf {} +
+find "${INSTALL_DIR}/backups" -maxdepth 1 -type d -mtime +"${RETENTION_DAYS}" -exec rm -rf {} +
 
 TOTAL=$(du -sh "$BACKUP_DIR" | awk '{print $1}')
 echo "[$(date -Iseconds)] Backup terminé: $BACKUP_DIR ($TOTAL)"
