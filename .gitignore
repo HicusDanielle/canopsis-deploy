@@ -1,0 +1,15 @@
+# Secrets
+.env
+*.key
+mongo-keyfile
+
+# Backups
+backups/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
